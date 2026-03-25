@@ -84,7 +84,13 @@ pub async fn reader_loop(
                     }
                 }
                 None => {
-                    // No pending entry — stale or already-cleaned-up response.
+                    // No pending entry — stale or already-cleaned-up response
+                    // (e.g. phase 2 of startLink after cleanup_multi_rpc).
+                    tracing::info!(
+                        rpc_id = id,
+                        response = %parsed,
+                        "RPC response for unknown/cleaned-up id — logging for diagnostics"
+                    );
                 }
             }
             continue;
