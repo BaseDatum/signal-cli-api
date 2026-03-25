@@ -28,20 +28,22 @@ struct QrLinkQuery {
     device_name: Option<String>,
 }
 
-/// Timeout for the second phase of startLink (waiting for phone to scan).
-const LINK_COMPLETION_TIMEOUT: Duration = Duration::from_secs(120);
-
 /// Helper: initiate startLink, return the URI from the first response,
-/// and spawn a background task to wait for the second response
-/// (provisioning completion).
+/// and immediately release the RPC so other calls aren't blocked.
 ///
 /// signal-cli's `startLink` JSON-RPC sends TWO responses with the same ID:
 /// 1. The `sgnl://linkdevice?...` URI (returned immediately)
 /// 2. The linked account number (after the phone scans the QR)
 ///
-/// We return the URI to the HTTP caller right away. A background tokio task
-/// keeps the RPC alive so the reader loop can deliver the second response
-/// to signal-cli, which finalizes the account registration.
+/// signal-cli's daemon processes RPCs sequentially on a single TCP
+/// connection. If we keep the pending entry alive waiting for phase 2,
+/// ALL other RPCs (listAccounts, send, health, etc.) will block.
+///
+/// Instead, we grab the URI from phase 1, immediately clean up the
+/// pending entry, and let signal-cli handle phase 2 internally. The
+/// account will still be written to disk when the phone scans — we
+/// just won't get a notification about it. The admin UI polls
+/// `/v1/accounts` to detect when linking completes.
 async fn start_link_two_phase(
     st: &AppState,
     params: serde_json::Value,
@@ -71,35 +73,14 @@ async fn start_link_two_phase(
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
-    // Phase 2: spawn a background task to wait for the linking completion.
-    // This keeps the mpsc entry alive so the reader_loop can deliver the
-    // second response to signal-cli, which finalizes account registration.
-    let st_clone = st.clone();
-    tokio::spawn(async move {
-        match tokio::time::timeout(LINK_COMPLETION_TIMEOUT, rx.recv()).await {
-            Ok(Some(resp)) => {
-                if let Some(err) = resp.get("error") {
-                    tracing::warn!("startLink phase 2 error: {err}");
-                } else {
-                    let account = resp
-                        .get("result")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    tracing::info!("startLink completed — account linked: {account}");
-                }
-            }
-            Ok(None) => {
-                tracing::warn!("startLink phase 2: channel closed before completion");
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "startLink phase 2 timed out after {}s — user may not have scanned the QR",
-                    LINK_COMPLETION_TIMEOUT.as_secs()
-                );
-            }
-        }
-        st_clone.cleanup_multi_rpc(rpc_id);
-    });
+    // Immediately clean up the pending entry so signal-cli's daemon
+    // isn't blocked waiting for us to consume phase 2. Signal-cli will
+    // still complete the provisioning internally and write the account
+    // to disk. The phase 2 response (with the account number) will be
+    // treated as a notification by the reader loop and broadcast to
+    // any WebSocket/SSE/webhook listeners.
+    st.cleanup_multi_rpc(rpc_id);
+    tracing::info!("startLink phase 1 complete — URI returned, pending entry released");
 
     Ok(uri_result)
 }
