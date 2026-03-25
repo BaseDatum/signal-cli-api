@@ -28,128 +28,113 @@ struct QrLinkQuery {
     device_name: Option<String>,
 }
 
-/// In TCP daemon mode, `startLink` sends TWO JSON-RPC responses with the
-/// same id on the TCP connection:
-///
-///   1. The `sgnl://linkdevice?...` URI (returned within seconds)
-///   2. The linked account number (after the phone scans — up to minutes)
-///
-/// We use `rpc_multi` to receive both. Phase 1 is returned to the HTTP
-/// caller immediately. A background task keeps the receiver alive for
-/// phase 2 (up to 5 minutes). When phase 2 arrives, signal-cli has
-/// completed provisioning and written the account to disk.
-///
-/// IMPORTANT: We must NOT clean up the pending entry after phase 1.
-/// Doing so causes the reader_loop to silently drop phase 2, and
-/// signal-cli may not complete provisioning if the response can't be
-/// delivered.
+/// Default timeout for finishLink (5 minutes — user needs time to scan).
+const FINISH_LINK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
-const PHASE2_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// In HTTP daemon mode, device linking is two separate RPCs
+/// (confirmed by DjinnBot's working implementation):
+///
+///   1. `startLink` — instant, returns `{ "deviceLinkUri": "sgnl://..." }`
+///   2. `finishLink` — blocks up to 5 minutes waiting for phone to scan
+///
+/// We return the URI to the caller immediately, then spawn finishLink
+/// in a background task. The admin UI polls /v1/accounts to detect
+/// when linking completes.
 
 async fn qrcodelink(
     axum::extract::Query(query): axum::extract::Query<QrLinkQuery>,
     State(st): State<AppState>,
 ) -> Response {
-    let mut params = json!({});
-    if let Some(name) = query.device_name {
-        params["deviceName"] = json!(name);
-    }
-    match start_link(&st, params).await {
-        Ok(result) => Json(result).into_response(),
+    let device_name = query.device_name.clone().unwrap_or_else(|| "signal-cli".to_string());
+
+    // Step 1: startLink — returns the URI.
+    let uri_result = match st.rpc("startLink", json!({})).await {
+        Ok(result) => result,
         Err(e) => {
             let status = crate::state::rpc_error_status(&e);
-            (status, Json(json!({ "error": e }))).into_response()
+            return (status, Json(json!({ "error": e }))).into_response();
         }
+    };
+
+    let uri = uri_result
+        .as_str()
+        .or_else(|| uri_result.get("deviceLinkUri").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+
+    if uri.is_empty() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "startLink did not return a URI" })),
+        )
+            .into_response();
     }
+
+    tracing::info!("startLink returned URI, spawning finishLink background task");
+
+    // Step 2: finishLink in background (blocks until phone scans).
+    spawn_finish_link(st, uri.clone(), device_name);
+
+    Json(json!({ "deviceLinkUri": uri })).into_response()
 }
 
 async fn qrcodelink_raw(
     axum::extract::Query(query): axum::extract::Query<QrLinkQuery>,
     State(st): State<AppState>,
 ) -> Response {
-    let mut params = json!({});
-    if let Some(name) = query.device_name {
-        params["deviceName"] = json!(name);
-    }
-    match start_link(&st, params).await {
-        Ok(result) => {
-            let uri = result
-                .as_str()
-                .or_else(|| result.get("deviceLinkUri").and_then(|v| v.as_str()))
-                .unwrap_or("");
-            (StatusCode::OK, uri.to_string()).into_response()
-        }
+    let device_name = query.device_name.clone().unwrap_or_else(|| "signal-cli".to_string());
+
+    let uri_result = match st.rpc("startLink", json!({})).await {
+        Ok(result) => result,
         Err(e) => {
             let status = crate::state::rpc_error_status(&e);
-            (status, Json(json!({ "error": e }))).into_response()
-        }
-    }
-}
-
-/// Send startLink, grab the URI from response #1, then spawn a
-/// background task that waits for response #2 (the account number
-/// after the phone scans).
-async fn start_link(
-    st: &AppState,
-    params: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    let (rpc_id, mut rx) = st.rpc_multi("startLink", params).await?;
-
-    // Phase 1: wait for the URI (first response).
-    let first = match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
-        Ok(Some(resp)) => resp,
-        Ok(None) => {
-            st.cleanup_multi_rpc(rpc_id);
-            return Err("signal-cli closed the channel before sending URI".to_string());
-        }
-        Err(_) => {
-            st.cleanup_multi_rpc(rpc_id);
-            return Err("Timeout waiting for startLink URI".to_string());
+            return (status, Json(json!({ "error": e }))).into_response();
         }
     };
 
-    if let Some(err) = first.get("error") {
-        st.cleanup_multi_rpc(rpc_id);
-        return Err(err.to_string());
+    let uri = uri_result
+        .as_str()
+        .or_else(|| uri_result.get("deviceLinkUri").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+
+    if uri.is_empty() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "startLink did not return a URI",
+        )
+            .into_response();
     }
 
-    let uri_result = first
-        .get("result")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
+    tracing::info!("startLink returned URI, spawning finishLink background task");
 
-    tracing::info!("startLink phase 1: URI received");
+    spawn_finish_link(st, uri.clone(), device_name);
 
-    // Phase 2: spawn a background task that keeps the receiver alive
-    // and waits for the account-number response after the phone scans.
-    // Do NOT cleanup the pending entry — the reader_loop needs it to
-    // route phase 2 to our receiver.
-    let st2 = st.clone();
+    (StatusCode::OK, uri).into_response()
+}
+
+/// Spawn a background task that calls `finishLink` and waits for the phone
+/// to scan the QR code (up to 5 minutes).
+fn spawn_finish_link(st: AppState, uri: String, device_name: String) {
     tokio::spawn(async move {
-        tracing::info!(
-            "startLink phase 2: waiting up to {:?} for QR scan...",
-            PHASE2_TIMEOUT
-        );
-        match tokio::time::timeout(PHASE2_TIMEOUT, rx.recv()).await {
-            Ok(Some(resp)) => {
-                if let Some(err) = resp.get("error") {
-                    tracing::error!("startLink phase 2 error: {err}");
-                } else {
-                    tracing::info!("startLink phase 2 complete: {resp}");
-                }
+        tracing::info!("finishLink: waiting for QR scan (timeout {:?})", FINISH_LINK_TIMEOUT);
+
+        let params = json!({
+            "deviceLinkUri": uri,
+            "deviceName": device_name,
+        });
+
+        let result = st.rpc_with_timeout("finishLink", params, FINISH_LINK_TIMEOUT).await;
+
+        match result {
+            Ok(resp) => {
+                tracing::info!("finishLink succeeded: {resp}");
             }
-            Ok(None) => {
-                tracing::warn!("startLink phase 2: channel closed (signal-cli disconnected?)");
-            }
-            Err(_) => {
-                tracing::warn!("startLink phase 2: timed out after {:?}", PHASE2_TIMEOUT);
+            Err(e) => {
+                tracing::error!("finishLink failed: {e}");
             }
         }
-        // Now clean up the pending entry.
-        st2.cleanup_multi_rpc(rpc_id);
     });
-
-    Ok(uri_result)
 }
 
 #[derive(Deserialize)]

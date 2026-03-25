@@ -1,205 +1,87 @@
-use crate::state::{Metrics, RpcResponse};
-use dashmap::DashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+//! SSE event reader for signal-cli's HTTP daemon.
+//!
+//! Replaces the TCP reader_loop. Connects to signal-cli's SSE endpoint
+//! at `/api/v1/events` and broadcasts incoming messages to WebSocket/SSE
+//! clients and webhooks.
+
+use crate::state::AppState;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{broadcast, mpsc, oneshot};
 
-/// Sender that can handle either a single response (oneshot) or multiple
-/// responses (mpsc) for the same RPC ID.
-pub enum PendingSender {
-    Once(oneshot::Sender<RpcResponse>),
-    Multi(mpsc::Sender<RpcResponse>),
-}
+/// Connect to signal-cli's SSE event stream and broadcast incoming
+/// notifications. Reconnects automatically on disconnect.
+pub async fn sse_reader_loop(st: AppState) {
+    let url = format!("{}/api/v1/events", st.signal_cli_url);
+    let mut backoff = Duration::from_secs(1);
 
-/// Lightweight tag so we can drop the DashMap Ref (and its read lock)
-/// before acting on the pending entry.
-enum SenderKind {
-    Once,
-    Multi,
-}
+    loop {
+        tracing::info!("Connecting to signal-cli SSE stream: {url}");
 
-/// Read loop: reads newline-delimited JSON from signal-cli, dispatches responses
-/// to pending futures and broadcasts notifications to WebSocket/SSE/webhook clients.
-///
-/// Sets `daemon_alive` to `false` on exit so that `/v1/health` returns 503
-/// and RPC callers fail fast instead of waiting for timeouts.
-pub async fn reader_loop(
-    reader: OwnedReadHalf,
-    broadcast_tx: broadcast::Sender<String>,
-    pending: Arc<DashMap<u64, PendingSender>>,
-    metrics: Arc<Metrics>,
-    daemon_alive: Arc<AtomicBool>,
-) {
-    let mut lines = BufReader::new(reader).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let parsed: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("Bad JSON from signal-cli: {e}");
-                continue;
-            }
-        };
+        match st.http_client.get(&url)
+            .header("Accept", "text/event-stream")
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!("SSE stream connected");
+                st.daemon_alive.store(true, Ordering::Relaxed);
+                backoff = Duration::from_secs(1); // reset on success
 
-        // RPC response (has "id" field)
-        //
-        // IMPORTANT: We must NOT hold a DashMap Ref (read lock) while
-        // calling remove() (write lock) on the same shard — that's an
-        // instant deadlock with parking_lot's non-reentrant RwLock.
-        // Similarly, holding a Ref across an .await point blocks
-        // writers on other tasks from accessing the same shard.
-        //
-        // Strategy: peek at the entry type, drop the Ref immediately,
-        // then act on the type without holding any lock.
-        if let Some(id) = parsed.get("id").and_then(|v| v.as_u64()) {
-            // Peek at what kind of sender is registered, then drop the
-            // read lock BEFORE doing anything else.
-            let sender_kind = pending.get(&id).map(|entry| match entry.value() {
-                PendingSender::Once(_) => SenderKind::Once,
-                PendingSender::Multi(_) => SenderKind::Multi,
-            });
-            // `entry` (Ref) is dropped here — read lock released.
+                // Read the SSE stream line by line.
+                use futures_util::StreamExt;
+                let mut stream = resp.bytes_stream();
+                let mut buffer = String::new();
+                let mut current_data = String::new();
 
-            match sender_kind {
-                Some(SenderKind::Once) => {
-                    // Now safe to acquire the write lock.
-                    if let Some((_, PendingSender::Once(tx))) = pending.remove(&id) {
-                        let _ = tx.send(parsed);
-                    }
-                }
-                Some(SenderKind::Multi) => {
-                    // Re-acquire a read lock briefly to clone the sender,
-                    // then drop it before the async send.
-                    let tx = pending.get(&id).and_then(|entry| {
-                        if let PendingSender::Multi(tx) = entry.value() {
-                            Some(tx.clone())
-                        } else {
-                            None
+                while let Some(chunk) = stream.next().await {
+                    let chunk = match chunk {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!("SSE stream read error: {e}");
+                            break;
                         }
-                    });
-                    if let Some(tx) = tx {
-                        let _ = tx.send(parsed.clone()).await;
+                    };
+
+                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                    // Process complete lines.
+                    while let Some(newline_pos) = buffer.find('\n') {
+                        let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
+                        buffer = buffer[newline_pos + 1..].to_string();
+
+                        if line.is_empty() {
+                            // Empty line = end of event. Dispatch if we have data.
+                            if !current_data.is_empty() {
+                                st.metrics.inc_received();
+                                let _ = st.broadcast_tx.send(current_data.clone());
+                                current_data.clear();
+                            }
+                        } else if let Some(data) = line.strip_prefix("data:") {
+                            let data = data.strip_prefix(' ').unwrap_or(data);
+                            if current_data.is_empty() {
+                                current_data = data.to_string();
+                            } else {
+                                current_data.push('\n');
+                                current_data.push_str(data);
+                            }
+                        }
+                        // Ignore event:, id:, comment lines
                     }
                 }
-                None => {
-                    // No pending entry — stale or already-cleaned-up response
-                    // (e.g. phase 2 of startLink after cleanup_multi_rpc).
-                    tracing::info!(
-                        rpc_id = id,
-                        response = %parsed,
-                        "RPC response for unknown/cleaned-up id — logging for diagnostics"
-                    );
-                }
+
+                tracing::warn!("SSE stream ended");
             }
-            continue;
+            Ok(resp) => {
+                tracing::warn!("SSE connect failed: HTTP {}", resp.status());
+            }
+            Err(e) => {
+                tracing::warn!("SSE connect error: {e}");
+            }
         }
 
-        // Notification (incoming message) — broadcast to all listeners
-        metrics.inc_received();
-        let _ = broadcast_tx.send(line);
+        st.daemon_alive.store(false, Ordering::Relaxed);
+        tracing::info!("Reconnecting SSE in {:?}...", backoff);
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(30));
     }
-    tracing::error!("signal-cli connection closed — marking daemon as dead");
-    daemon_alive.store(false, Ordering::Relaxed);
-}
-
-/// Dedicated writer loop: serialises all writes through a single task.
-///
-/// Sets `daemon_alive` to `false` on exit.
-pub async fn writer_loop(
-    mut rx: tokio::sync::mpsc::Receiver<String>,
-    mut writer: OwnedWriteHalf,
-    daemon_alive: Arc<AtomicBool>,
-) {
-    while let Some(line) = rx.recv().await {
-        if let Err(e) = writer.write_all(line.as_bytes()).await {
-            tracing::error!("Failed to write to signal-cli: {e}");
-            break;
-        }
-        let _ = writer.flush().await;
-    }
-    tracing::error!("Writer channel closed — marking daemon as dead");
-    daemon_alive.store(false, Ordering::Relaxed);
-}
-
-/// Send a JSON-RPC request and wait for a single response, with a timeout.
-pub async fn rpc_call(
-    writer_tx: &tokio::sync::mpsc::Sender<String>,
-    pending: &Arc<DashMap<u64, PendingSender>>,
-    next_id: &Arc<AtomicU64>,
-    method: &str,
-    params: serde_json::Value,
-    timeout: Duration,
-) -> Result<serde_json::Value, String> {
-    let id = next_id.fetch_add(1, Ordering::Relaxed);
-
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": method,
-        "params": params,
-        "id": id,
-    });
-
-    let (tx, rx) = oneshot::channel();
-    pending.insert(id, PendingSender::Once(tx));
-
-    let mut line = serde_json::to_string(&request).map_err(|e| e.to_string())?;
-    line.push('\n');
-
-    writer_tx.send(line).await.map_err(|e| e.to_string())?;
-
-    let response = match tokio::time::timeout(timeout, rx).await {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(_)) => return Err("signal-cli did not respond".to_string()),
-        Err(_) => {
-            pending.remove(&id);
-            return Err(crate::state::RPC_TIMEOUT_ERROR.to_string());
-        }
-    };
-
-    if let Some(err) = response.get("error") {
-        return Err(err.to_string());
-    }
-
-    Ok(response
-        .get("result")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null))
-}
-
-/// Send a JSON-RPC request that produces multiple responses (e.g. `startLink`).
-///
-/// Returns `(id, mpsc::Receiver)` — the caller reads responses from the
-/// receiver and MUST call `cleanup_multi(pending, id)` when done.
-pub async fn rpc_call_multi(
-    writer_tx: &tokio::sync::mpsc::Sender<String>,
-    pending: &Arc<DashMap<u64, PendingSender>>,
-    next_id: &Arc<AtomicU64>,
-    method: &str,
-    params: serde_json::Value,
-) -> Result<(u64, mpsc::Receiver<RpcResponse>), String> {
-    let id = next_id.fetch_add(1, Ordering::Relaxed);
-
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": method,
-        "params": params,
-        "id": id,
-    });
-
-    let (tx, rx) = mpsc::channel(4);
-    pending.insert(id, PendingSender::Multi(tx));
-
-    let mut line = serde_json::to_string(&request).map_err(|e| e.to_string())?;
-    line.push('\n');
-
-    writer_tx.send(line).await.map_err(|e| e.to_string())?;
-
-    Ok((id, rx))
-}
-
-/// Remove a multi-response pending entry (cleanup after startLink completes).
-pub fn cleanup_multi(pending: &Arc<DashMap<u64, PendingSender>>, id: u64) {
-    pending.remove(&id);
 }

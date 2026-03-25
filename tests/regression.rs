@@ -1,165 +1,80 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use axum::{Router, Json, routing::post};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 
-/// Start a mock TCP server that speaks newline-delimited JSON-RPC.
-/// Returns canned responses based on the method name.
-/// The "simulateError" method returns a JSON-RPC error to test error paths.
-async fn start_mock_signal_cli() -> SocketAddr {
+/// Start a mock HTTP server that mimics signal-cli's HTTP daemon `/api/v1/rpc`.
+/// Returns the base URL (e.g. "http://127.0.0.1:12345").
+async fn start_mock_signal_cli() -> String {
+    async fn handle_rpc(
+        Json(req): Json<serde_json::Value>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+
+        let id = req["id"].clone();
+        let method = req["method"].as_str().unwrap_or("");
+
+        // Error simulation
+        let params = req.get("params");
+        let is_error = method == "simulateError"
+            || params.and_then(|p| p.get("account")).and_then(|a| a.as_str()) == Some("+ERROR")
+            || params.and_then(|p| p.get("number")).and_then(|a| a.as_str()) == Some("+ERROR");
+
+        if is_error {
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "error": {"code": -32000, "message": "simulated signal-cli error"},
+                "id": id
+            });
+            return Json(response).into_response();
+        }
+
+        // void methods return 201 with no body
+        let void_methods = ["finishLink", "removeDevice", "deleteLocalAccountData",
+            "quitGroup", "joinGroup", "block", "updateContact", "sendContacts",
+            "updateProfile", "trust", "register", "verify", "unregister",
+            "submitRateLimitChallenge", "updateAccountSettings", "setPin", "removePin",
+            "setUsername", "removeUsername", "sendTyping", "removeReaction", "sendReceipt",
+            "setConfiguration", "setAccountSettings", "deleteAttachment",
+            "sendPollVote", "closePoll", "remoteDelete"];
+
+        if void_methods.contains(&method) {
+            return (axum::http::StatusCode::CREATED, "").into_response();
+        }
+
+        let result = match method {
+            "send" => serde_json::json!({"timestamp": 1234567890}),
+            "updateGroup" => serde_json::json!({"groupId": "g1"}),
+            "listGroups" => serde_json::json!([{"id": "g1", "name": "Test Group", "members": ["+1111"]}]),
+            "listContacts" => serde_json::json!([{"number": "+1111", "name": "Alice"}]),
+            "listIdentities" => serde_json::json!([{"number": "+1111", "status": "TRUSTED"}]),
+            "listAccounts" => serde_json::json!(["+1234567890"]),
+            "listDevices" => serde_json::json!([{"id": 1, "name": "Desktop"}]),
+            "startLink" => serde_json::json!({"deviceLinkUri": "sgnl://linkdevice?uuid=test&pub_key=abc"}),
+            "sendReaction" => serde_json::json!({"timestamp": 1234567890}),
+            "getUserStatus" => serde_json::json!([{"number": "+1111", "registered": true}]),
+            "listStickerPacks" => serde_json::json!([{"packId": "sp1", "title": "Cool Pack"}]),
+            "uploadStickerPack" => serde_json::json!({"packId": "sp2"}),
+            "sendPoll" => serde_json::json!({"timestamp": 1234567890}),
+            "listAttachments" => serde_json::json!([{"id": "att1", "filename": "photo.jpg"}]),
+            "getAttachment" => serde_json::json!({"id": "att1", "filename": "photo.jpg", "size": 12345}),
+            "getConfiguration" => serde_json::json!({"trustMode": "always"}),
+            "getAccountSettings" => serde_json::json!({"trustMode": "on-first-use"}),
+            _ => serde_json::json!({}),
+        };
+
+        let response = serde_json::json!({"jsonrpc": "2.0", "result": result, "id": id});
+        Json(response).into_response()
+    }
+
+    let app = Router::new().route("/api/v1/rpc", post(handle_rpc));
     let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = listener.accept().await.unwrap();
-            tokio::spawn(async move {
-                let (reader, mut writer) = stream.into_split();
-                let mut lines = BufReader::new(reader).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let req: serde_json::Value = match serde_json::from_str(&line) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    let id = req["id"].clone();
-                    let method = req["method"].as_str().unwrap_or("");
-
-                    // Special: return a JSON-RPC error for "simulateError"
-                    // OR when account/number is "+ERROR" (triggers error path on any endpoint)
-                    let params = req.get("params");
-                    let is_error = method == "simulateError"
-                        || params
-                            .and_then(|p| p.get("account"))
-                            .and_then(|a| a.as_str())
-                            == Some("+ERROR")
-                        || params
-                            .and_then(|p| p.get("number"))
-                            .and_then(|a| a.as_str())
-                            == Some("+ERROR");
-                    if is_error {
-                        let response = serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "error": {"code": -32000, "message": "simulated signal-cli error"},
-                            "id": id
-                        });
-                        let mut resp_line = serde_json::to_string(&response).unwrap();
-                        resp_line.push('\n');
-                        let _ = writer.write_all(resp_line.as_bytes()).await;
-                        let _ = writer.flush().await;
-                        continue;
-                    }
-
-                    let result = match method {
-                        // Messages
-                        "send" => serde_json::json!({"timestamp": 1234567890}),
-                        "remoteDelete" => serde_json::json!({}),
-
-                        // Groups
-                        "listGroups" => {
-                            serde_json::json!([{"id": "g1", "name": "Test Group", "members": ["+1111"]}])
-                        }
-                        "updateGroup" => serde_json::json!({"groupId": "g1"}),
-                        "quitGroup" => serde_json::json!({}),
-                        "joinGroup" => serde_json::json!({}),
-                        "block" => serde_json::json!({}),
-
-                        // Contacts
-                        "listContacts" => {
-                            serde_json::json!([{"number": "+1111", "name": "Alice"}])
-                        }
-                        "updateContact" => serde_json::json!({}),
-                        "sendContacts" => serde_json::json!({}),
-
-                        // Profiles
-                        "updateProfile" => serde_json::json!({}),
-
-                        // Identities
-                        "listIdentities" => {
-                            serde_json::json!([{"number": "+1111", "status": "TRUSTED"}])
-                        }
-                        "trust" => serde_json::json!({}),
-
-                        // Accounts
-                        "listAccounts" => serde_json::json!(["+1234567890"]),
-                        "register" => serde_json::json!({}),
-                        "verify" => serde_json::json!({}),
-                        "unregister" => serde_json::json!({}),
-                        "submitRateLimitChallenge" => serde_json::json!({}),
-                        "updateAccountSettings" => serde_json::json!({}),
-                        "setPin" => serde_json::json!({}),
-                        "removePin" => serde_json::json!({}),
-                        "setUsername" => serde_json::json!({}),
-                        "removeUsername" => serde_json::json!({}),
-
-                        // Devices
-                        "listDevices" => {
-                            serde_json::json!([{"id": 1, "name": "Desktop"}])
-                        }
-                        "startLink" => {
-                            serde_json::json!({"deviceLinkUri": "sgnl://linkdevice?uuid=test&pub_key=abc"})
-                        }
-                        "finishLink" => serde_json::json!({}),
-                        "removeDevice" => serde_json::json!({}),
-                        "deleteLocalAccountData" => serde_json::json!({}),
-
-                        // Typing
-                        "sendTyping" => serde_json::json!({}),
-
-                        // Reactions
-                        "sendReaction" => serde_json::json!({"timestamp": 1234567890}),
-                        "removeReaction" => serde_json::json!({}),
-
-                        // Receipts
-                        "sendReceipt" => serde_json::json!({}),
-
-                        // Search
-                        "getUserStatus" => {
-                            serde_json::json!([{"number": "+1111", "registered": true}])
-                        }
-
-                        // Stickers
-                        "listStickerPacks" => {
-                            serde_json::json!([{"packId": "sp1", "title": "Cool Pack"}])
-                        }
-                        "uploadStickerPack" => serde_json::json!({"packId": "sp2"}),
-
-                        // Polls
-                        "sendPoll" => serde_json::json!({"timestamp": 1234567890}),
-                        "sendPollVote" => serde_json::json!({}),
-                        "closePoll" => serde_json::json!({}),
-
-                        // Attachments
-                        "listAttachments" => {
-                            serde_json::json!([{"id": "att1", "filename": "photo.jpg"}])
-                        }
-                        "getAttachment" => {
-                            serde_json::json!({"id": "att1", "filename": "photo.jpg", "size": 12345})
-                        }
-                        "deleteAttachment" => serde_json::json!({}),
-
-                        // Config
-                        "getConfiguration" => serde_json::json!({"trustMode": "always"}),
-                        "setConfiguration" => serde_json::json!({}),
-                        "getAccountSettings" => {
-                            serde_json::json!({"trustMode": "on-first-use"})
-                        }
-                        "setAccountSettings" => serde_json::json!({}),
-
-                        // Default: return empty object
-                        _ => serde_json::json!({}),
-                    };
-                    let response =
-                        serde_json::json!({"jsonrpc": "2.0", "result": result, "id": id});
-                    let mut resp_line = serde_json::to_string(&response).unwrap();
-                    resp_line.push('\n');
-                    let _ = writer.write_all(resp_line.as_bytes()).await;
-                    let _ = writer.flush().await;
-                }
-            });
-        }
-    });
-    addr
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    format!("http://{addr}")
 }
 
 /// Returned from setup_with_broadcast — gives tests access to the broadcast
@@ -170,30 +85,14 @@ struct TestHarness {
     metrics: Arc<signal_cli_api::state::Metrics>,
 }
 
-/// Connect to the mock signal-cli, build AppState, spawn the reader loop,
-/// start the axum server on a random port, and return the full harness.
+/// Set up the mock signal-cli HTTP daemon, build AppState, start the
+/// axum server on a random port, and return the full harness.
 async fn setup_full() -> TestHarness {
-    let mock_addr = start_mock_signal_cli().await;
-    let stream = tokio::net::TcpStream::connect(mock_addr).await.unwrap();
-    let (reader, writer) = stream.into_split();
-
-    let (writer_tx, writer_rx) = tokio::sync::mpsc::channel::<String>(256);
-    let state = signal_cli_api::state::AppState::new(writer_tx);
-
-    let daemon_alive_w = state.daemon_alive.clone();
-    tokio::spawn(signal_cli_api::jsonrpc::writer_loop(writer_rx, writer, daemon_alive_w));
+    let mock_url = start_mock_signal_cli().await;
+    let state = signal_cli_api::state::AppState::new(mock_url);
 
     let broadcast_tx = state.broadcast_tx.clone();
-    let pending = state.pending.clone();
     let metrics = state.metrics.clone();
-    let daemon_alive_r = state.daemon_alive.clone();
-    tokio::spawn(signal_cli_api::jsonrpc::reader_loop(
-        reader,
-        broadcast_tx.clone(),
-        pending,
-        metrics.clone(),
-        daemon_alive_r,
-    ));
 
     // Spawn webhook dispatcher (mirrors main.rs)
     let webhook_state = state.clone();
@@ -1714,28 +1613,9 @@ async fn setup_tls() -> (String, reqwest::Client) {
     // rustls 0.23+ requires an explicit crypto provider
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let mock_addr = start_mock_signal_cli().await;
-    let stream = tokio::net::TcpStream::connect(mock_addr).await.unwrap();
-    let (reader, writer) = stream.into_split();
+    let mock_url = start_mock_signal_cli().await;
 
-    let (writer_tx, writer_rx) = tokio::sync::mpsc::channel::<String>(256);
-
-    let state = signal_cli_api::state::AppState::new(writer_tx);
-
-    let daemon_alive_w = state.daemon_alive.clone();
-    tokio::spawn(signal_cli_api::jsonrpc::writer_loop(writer_rx, writer, daemon_alive_w));
-
-    let broadcast_tx = state.broadcast_tx.clone();
-    let pending = state.pending.clone();
-    let metrics = state.metrics.clone();
-    let daemon_alive_r = state.daemon_alive.clone();
-    tokio::spawn(signal_cli_api::jsonrpc::reader_loop(
-        reader,
-        broadcast_tx,
-        pending,
-        metrics,
-        daemon_alive_r,
-    ));
+    let state = signal_cli_api::state::AppState::new(mock_url);
 
     let app = signal_cli_api::routes::router(state);
 
@@ -3368,48 +3248,25 @@ async fn test_receipt_to_group() {
 // RPC timeout
 // ===========================================================================
 
-/// A mock that accepts connections but never responds — simulates signal-cli hanging.
-async fn start_hanging_mock() -> SocketAddr {
+/// A mock HTTP server that accepts requests but never responds — simulates signal-cli hanging.
+async fn start_hanging_mock() -> String {
+    async fn hanging_handler() -> axum::response::Response {
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        unreachable!()
+    }
+
+    let app = Router::new().route("/api/v1/rpc", post(hanging_handler));
     let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = listener.accept().await.unwrap();
-            tokio::spawn(async move {
-                let (reader, _writer) = stream.into_split();
-                let mut lines = BufReader::new(reader).lines();
-                // Read lines to keep the connection open, but never write back
-                while let Ok(Some(_)) = lines.next_line().await {}
-            });
-        }
-    });
-    addr
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    format!("http://{addr}")
 }
 
 async fn setup_with_timeout(timeout: std::time::Duration) -> String {
-    let mock_addr = start_hanging_mock().await;
-    let stream = tokio::net::TcpStream::connect(mock_addr).await.unwrap();
-    let (reader, writer) = stream.into_split();
-
-    let (writer_tx, writer_rx) = tokio::sync::mpsc::channel::<String>(256);
-
-    let mut state = signal_cli_api::state::AppState::new(writer_tx);
+    let mock_url = start_hanging_mock().await;
+    let mut state = signal_cli_api::state::AppState::new(mock_url);
     state.rpc_timeout = timeout;
-
-    let daemon_alive_w = state.daemon_alive.clone();
-    tokio::spawn(signal_cli_api::jsonrpc::writer_loop(writer_rx, writer, daemon_alive_w));
-
-    let broadcast_tx = state.broadcast_tx.clone();
-    let pending = state.pending.clone();
-    let metrics = state.metrics.clone();
-    let daemon_alive_r = state.daemon_alive.clone();
-    tokio::spawn(signal_cli_api::jsonrpc::reader_loop(
-        reader,
-        broadcast_tx,
-        pending,
-        metrics,
-        daemon_alive_r,
-    ));
 
     let app = signal_cli_api::routes::router(state).layer(CorsLayer::permissive());
     let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();

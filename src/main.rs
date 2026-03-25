@@ -8,14 +8,14 @@ mod webhooks;
 use axum::middleware as axum_mw;
 use clap::Parser;
 use std::net::SocketAddr;
-use tokio::net::TcpStream;
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "signal-cli-api", about = "REST + WebSocket API for signal-cli")]
 struct Cli {
-    /// Connect to an existing signal-cli daemon at this address.
+    /// Connect to an existing signal-cli HTTP daemon at this URL
+    /// (e.g. http://127.0.0.1:8820).
     /// If omitted, signal-cli is auto-spawned as a child process.
     #[arg(long)]
     signal_cli: Option<String>,
@@ -43,34 +43,22 @@ async fn main() -> anyhow::Result<()> {
 
     // Either connect to an existing daemon or auto-spawn one.
     let _managed_daemon; // held alive so child process isn't dropped
-    let signal_cli_addr = match cli.signal_cli {
-        Some(addr) => addr,
+    let signal_cli_url = match cli.signal_cli {
+        Some(url) => url,
         None => {
             let d = daemon::spawn().await?;
-            let addr = d.addr.clone();
+            let url = d.base_url.clone();
             _managed_daemon = d;
-            addr
+            url
         }
     };
 
-    tracing::info!("Connecting to signal-cli at {signal_cli_addr}");
-    let stream = TcpStream::connect(&signal_cli_addr).await?;
-    let (reader, writer) = stream.into_split();
+    tracing::info!("Using signal-cli HTTP daemon at {signal_cli_url}");
+    let app_state = state::AppState::new(signal_cli_url.clone());
 
-    let (writer_tx, writer_rx) = tokio::sync::mpsc::channel::<String>(256);
-
-    let app_state = state::AppState::new(writer_tx);
-
-    // Spawn the writer and reader loops, passing daemon_alive so they
-    // can mark the connection as dead if it drops.
-    let daemon_alive_w = app_state.daemon_alive.clone();
-    tokio::spawn(jsonrpc::writer_loop(writer_rx, writer, daemon_alive_w));
-
-    let broadcast_tx = app_state.broadcast_tx.clone();
-    let pending = app_state.pending.clone();
-    let metrics = app_state.metrics.clone();
-    let daemon_alive_r = app_state.daemon_alive.clone();
-    tokio::spawn(jsonrpc::reader_loop(reader, broadcast_tx, pending, metrics, daemon_alive_r));
+    // Spawn SSE reader for incoming message notifications.
+    let sse_state = app_state.clone();
+    tokio::spawn(jsonrpc::sse_reader_loop(sse_state));
 
     // Spawn webhook dispatcher
     let webhook_state = app_state.clone();
@@ -85,7 +73,6 @@ async fn main() -> anyhow::Result<()> {
     match (cli.tls_cert, cli.tls_key) {
         (Some(cert), Some(key)) => {
             let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key).await?;
-            // Probe with a regular TcpListener; if busy, fall back to OS-assigned port.
             let addr = match tokio::net::TcpListener::bind(requested).await {
                 Ok(probe) => { drop(probe); requested }
                 Err(_) => {
