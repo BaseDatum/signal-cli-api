@@ -178,18 +178,21 @@ async fn setup_full() -> TestHarness {
     let (reader, writer) = stream.into_split();
 
     let (writer_tx, writer_rx) = tokio::sync::mpsc::channel::<String>(256);
-    tokio::spawn(signal_cli_api::jsonrpc::writer_loop(writer_rx, writer));
-
     let state = signal_cli_api::state::AppState::new(writer_tx);
+
+    let daemon_alive_w = state.daemon_alive.clone();
+    tokio::spawn(signal_cli_api::jsonrpc::writer_loop(writer_rx, writer, daemon_alive_w));
 
     let broadcast_tx = state.broadcast_tx.clone();
     let pending = state.pending.clone();
     let metrics = state.metrics.clone();
+    let daemon_alive_r = state.daemon_alive.clone();
     tokio::spawn(signal_cli_api::jsonrpc::reader_loop(
         reader,
         broadcast_tx.clone(),
         pending,
         metrics.clone(),
+        daemon_alive_r,
     ));
 
     // Spawn webhook dispatcher (mirrors main.rs)
@@ -1716,18 +1719,22 @@ async fn setup_tls() -> (String, reqwest::Client) {
     let (reader, writer) = stream.into_split();
 
     let (writer_tx, writer_rx) = tokio::sync::mpsc::channel::<String>(256);
-    tokio::spawn(signal_cli_api::jsonrpc::writer_loop(writer_rx, writer));
 
     let state = signal_cli_api::state::AppState::new(writer_tx);
+
+    let daemon_alive_w = state.daemon_alive.clone();
+    tokio::spawn(signal_cli_api::jsonrpc::writer_loop(writer_rx, writer, daemon_alive_w));
 
     let broadcast_tx = state.broadcast_tx.clone();
     let pending = state.pending.clone();
     let metrics = state.metrics.clone();
+    let daemon_alive_r = state.daemon_alive.clone();
     tokio::spawn(signal_cli_api::jsonrpc::reader_loop(
         reader,
         broadcast_tx,
         pending,
         metrics,
+        daemon_alive_r,
     ));
 
     let app = signal_cli_api::routes::router(state);
@@ -3385,19 +3392,23 @@ async fn setup_with_timeout(timeout: std::time::Duration) -> String {
     let (reader, writer) = stream.into_split();
 
     let (writer_tx, writer_rx) = tokio::sync::mpsc::channel::<String>(256);
-    tokio::spawn(signal_cli_api::jsonrpc::writer_loop(writer_rx, writer));
 
     let mut state = signal_cli_api::state::AppState::new(writer_tx);
     state.rpc_timeout = timeout;
 
+    let daemon_alive_w = state.daemon_alive.clone();
+    tokio::spawn(signal_cli_api::jsonrpc::writer_loop(writer_rx, writer, daemon_alive_w));
+
     let broadcast_tx = state.broadcast_tx.clone();
     let pending = state.pending.clone();
     let metrics = state.metrics.clone();
+    let daemon_alive_r = state.daemon_alive.clone();
     tokio::spawn(signal_cli_api::jsonrpc::reader_loop(
         reader,
         broadcast_tx,
         pending,
         metrics,
+        daemon_alive_r,
     ));
 
     let app = signal_cli_api::routes::router(state).layer(CorsLayer::permissive());

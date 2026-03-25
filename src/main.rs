@@ -58,15 +58,19 @@ async fn main() -> anyhow::Result<()> {
     let (reader, writer) = stream.into_split();
 
     let (writer_tx, writer_rx) = tokio::sync::mpsc::channel::<String>(256);
-    tokio::spawn(jsonrpc::writer_loop(writer_rx, writer));
 
     let app_state = state::AppState::new(writer_tx);
 
-    // Spawn the reader loop
+    // Spawn the writer and reader loops, passing daemon_alive so they
+    // can mark the connection as dead if it drops.
+    let daemon_alive_w = app_state.daemon_alive.clone();
+    tokio::spawn(jsonrpc::writer_loop(writer_rx, writer, daemon_alive_w));
+
     let broadcast_tx = app_state.broadcast_tx.clone();
     let pending = app_state.pending.clone();
     let metrics = app_state.metrics.clone();
-    tokio::spawn(jsonrpc::reader_loop(reader, broadcast_tx, pending, metrics));
+    let daemon_alive_r = app_state.daemon_alive.clone();
+    tokio::spawn(jsonrpc::reader_loop(reader, broadcast_tx, pending, metrics, daemon_alive_r));
 
     // Spawn webhook dispatcher
     let webhook_state = app_state.clone();

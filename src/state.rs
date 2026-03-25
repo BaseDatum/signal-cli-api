@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -85,15 +85,25 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     pub webhooks: Arc<RwLock<Vec<WebhookConfig>>>,
     pub rpc_timeout: Duration,
+    /// Set to `false` when the TCP connection to signal-cli daemon dies.
+    /// Checked by `/v1/health` (so k8s liveness probe restarts us) and
+    /// by `rpc()`/`rpc_multi()` (so callers fail fast instead of waiting
+    /// 30 seconds for a timeout on a dead pipe).
+    pub daemon_alive: Arc<AtomicBool>,
 }
 
 /// Sentinel error string returned when an RPC call times out.
 pub const RPC_TIMEOUT_ERROR: &str = "RPC_TIMEOUT";
 
+/// Sentinel error string returned when the daemon connection is dead.
+pub const DAEMON_DEAD_ERROR: &str = "DAEMON_DEAD";
+
 /// Map an RPC error string to the appropriate HTTP status code.
 pub fn rpc_error_status(err: &str) -> axum::http::StatusCode {
     if err == RPC_TIMEOUT_ERROR {
         axum::http::StatusCode::GATEWAY_TIMEOUT
+    } else if err == DAEMON_DEAD_ERROR {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
     } else {
         axum::http::StatusCode::BAD_REQUEST
     }
@@ -110,11 +120,25 @@ impl AppState {
             metrics: Arc::new(Metrics::default()),
             webhooks: Arc::new(RwLock::new(Vec::new())),
             rpc_timeout: Duration::from_secs(30),
+            daemon_alive: Arc::new(AtomicBool::new(true)),
         }
     }
 
+    /// Returns true if the signal-cli daemon TCP connection is alive.
+    pub fn is_daemon_alive(&self) -> bool {
+        self.daemon_alive.load(Ordering::Relaxed)
+    }
+
     /// Helper: make a JSON-RPC call to signal-cli (single response).
+    ///
+    /// Fails immediately with `DAEMON_DEAD` if the connection is known
+    /// to be down, instead of waiting 30 s for a timeout.
     pub async fn rpc(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+        if !self.is_daemon_alive() {
+            self.metrics.inc_rpc();
+            self.metrics.inc_rpc_error();
+            return Err(DAEMON_DEAD_ERROR.to_string());
+        }
         self.metrics.inc_rpc();
         let result = crate::jsonrpc::rpc_call(
             &self.writer_tx,
@@ -140,6 +164,11 @@ impl AppState {
         method: &str,
         params: serde_json::Value,
     ) -> Result<(u64, mpsc::Receiver<RpcResponse>), String> {
+        if !self.is_daemon_alive() {
+            self.metrics.inc_rpc();
+            self.metrics.inc_rpc_error();
+            return Err(DAEMON_DEAD_ERROR.to_string());
+        }
         self.metrics.inc_rpc();
         crate::jsonrpc::rpc_call_multi(
             &self.writer_tx,
