@@ -2,7 +2,9 @@ use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, RwLock, oneshot};
+use tokio::sync::{broadcast, mpsc, RwLock};
+
+use crate::jsonrpc::PendingSender;
 
 pub type RpcResponse = serde_json::Value;
 
@@ -78,7 +80,7 @@ pub struct WebhookConfig {
 pub struct AppState {
     pub writer_tx: tokio::sync::mpsc::Sender<String>,
     pub broadcast_tx: broadcast::Sender<String>,
-    pub pending: Arc<DashMap<u64, oneshot::Sender<RpcResponse>>>,
+    pub pending: Arc<DashMap<u64, PendingSender>>,
     pub next_id: Arc<AtomicU64>,
     pub metrics: Arc<Metrics>,
     pub webhooks: Arc<RwLock<Vec<WebhookConfig>>>,
@@ -111,7 +113,7 @@ impl AppState {
         }
     }
 
-    /// Helper: make a JSON-RPC call to signal-cli.
+    /// Helper: make a JSON-RPC call to signal-cli (single response).
     pub async fn rpc(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
         self.metrics.inc_rpc();
         let result = crate::jsonrpc::rpc_call(
@@ -127,5 +129,30 @@ impl AppState {
             self.metrics.inc_rpc_error();
         }
         result
+    }
+
+    /// Start a multi-response JSON-RPC call (e.g. `startLink`).
+    ///
+    /// Returns `(rpc_id, Receiver)`. The caller reads responses from the
+    /// receiver and MUST call `cleanup_multi_rpc(rpc_id)` when done.
+    pub async fn rpc_multi(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<(u64, mpsc::Receiver<RpcResponse>), String> {
+        self.metrics.inc_rpc();
+        crate::jsonrpc::rpc_call_multi(
+            &self.writer_tx,
+            &self.pending,
+            &self.next_id,
+            method,
+            params,
+        )
+        .await
+    }
+
+    /// Clean up a multi-response pending entry.
+    pub fn cleanup_multi_rpc(&self, id: u64) {
+        crate::jsonrpc::cleanup_multi(&self.pending, id);
     }
 }

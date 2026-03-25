@@ -5,6 +5,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
+use std::time::Duration;
 
 use crate::state::AppState;
 use super::helpers::{rpc_ok, rpc_no_content};
@@ -27,6 +28,82 @@ struct QrLinkQuery {
     device_name: Option<String>,
 }
 
+/// Timeout for the second phase of startLink (waiting for phone to scan).
+const LINK_COMPLETION_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Helper: initiate startLink, return the URI from the first response,
+/// and spawn a background task to wait for the second response
+/// (provisioning completion).
+///
+/// signal-cli's `startLink` JSON-RPC sends TWO responses with the same ID:
+/// 1. The `sgnl://linkdevice?...` URI (returned immediately)
+/// 2. The linked account number (after the phone scans the QR)
+///
+/// We return the URI to the HTTP caller right away. A background tokio task
+/// keeps the RPC alive so the reader loop can deliver the second response
+/// to signal-cli, which finalizes the account registration.
+async fn start_link_two_phase(
+    st: &AppState,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let (rpc_id, mut rx) = st.rpc_multi("startLink", params).await?;
+
+    // Phase 1: wait for the URI (first response).
+    let first = match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
+        Ok(Some(resp)) => resp,
+        Ok(None) => {
+            st.cleanup_multi_rpc(rpc_id);
+            return Err("signal-cli closed the connection".to_string());
+        }
+        Err(_) => {
+            st.cleanup_multi_rpc(rpc_id);
+            return Err("Timeout waiting for startLink URI".to_string());
+        }
+    };
+
+    if let Some(err) = first.get("error") {
+        st.cleanup_multi_rpc(rpc_id);
+        return Err(err.to_string());
+    }
+
+    let uri_result = first
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    // Phase 2: spawn a background task to wait for the linking completion.
+    // This keeps the mpsc entry alive so the reader_loop can deliver the
+    // second response to signal-cli, which finalizes account registration.
+    let st_clone = st.clone();
+    tokio::spawn(async move {
+        match tokio::time::timeout(LINK_COMPLETION_TIMEOUT, rx.recv()).await {
+            Ok(Some(resp)) => {
+                if let Some(err) = resp.get("error") {
+                    tracing::warn!("startLink phase 2 error: {err}");
+                } else {
+                    let account = resp
+                        .get("result")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    tracing::info!("startLink completed — account linked: {account}");
+                }
+            }
+            Ok(None) => {
+                tracing::warn!("startLink phase 2: channel closed before completion");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "startLink phase 2 timed out after {}s — user may not have scanned the QR",
+                    LINK_COMPLETION_TIMEOUT.as_secs()
+                );
+            }
+        }
+        st_clone.cleanup_multi_rpc(rpc_id);
+    });
+
+    Ok(uri_result)
+}
+
 async fn qrcodelink(
     axum::extract::Query(query): axum::extract::Query<QrLinkQuery>,
     State(st): State<AppState>,
@@ -35,7 +112,13 @@ async fn qrcodelink(
     if let Some(name) = query.device_name {
         params["deviceName"] = json!(name);
     }
-    rpc_ok(&st, "startLink", params).await
+    match start_link_two_phase(&st, params).await {
+        Ok(result) => Json(result).into_response(),
+        Err(e) => {
+            let status = crate::state::rpc_error_status(&e);
+            (status, Json(json!({ "error": e }))).into_response()
+        }
+    }
 }
 
 async fn qrcodelink_raw(
@@ -46,8 +129,7 @@ async fn qrcodelink_raw(
     if let Some(name) = query.device_name {
         params["deviceName"] = json!(name);
     }
-    // Special case: returns plain text, not JSON
-    match st.rpc("startLink", params).await {
+    match start_link_two_phase(&st, params).await {
         Ok(result) => {
             let uri = result
                 .as_str()
